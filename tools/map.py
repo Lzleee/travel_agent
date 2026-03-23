@@ -8,15 +8,30 @@ from pydantic import Field
 
 load_dotenv()
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 GOOGLE_PLACE_TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 
 
-def _require_api_key() -> str | None:
-    if GOOGLE_MAPS_API_KEY:
-        return None
-    return "未配置 GOOGLE_MAPS_API_KEY，暂时无法使用 Google 地图工具。"
+def _get_api_key() -> str:
+    return os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+
+
+def _require_api_key() -> tuple[str | None, str]:
+    key = _get_api_key()
+    if key:
+        return None, key
+    return "未配置 GOOGLE_MAPS_API_KEY，暂时无法使用 Google 地图工具。", ""
+
+
+def _google_error_message(prefix: str, status: str, data: dict, http_status: int | None = None) -> str:
+    detail = str(data.get("error_message") or "").strip()
+    http_part = f"HTTP {http_status}，" if http_status else ""
+    base = f"{prefix}失败，{http_part}状态：{status}"
+    if detail:
+        base += f"；原因：{detail}"
+    if status == "REQUEST_DENIED":
+        base += "。请检查：API Key 是否正确、是否启用 Places/Directions API、是否绑定结算、Key 限制（IP/HTTP referrer）是否匹配当前环境。"
+    return base
 
 
 @function_tool
@@ -26,7 +41,7 @@ async def search_places_google(
     limit: Annotated[int, Field(description="返回数量，建议 3-8")] = 5,
 ) -> str:
     """使用 Google Places Text Search 搜索地点，返回名称、评分、地址和坐标。"""
-    missing = _require_api_key()
+    missing, api_key = _require_api_key()
     if missing:
         return missing
 
@@ -34,17 +49,20 @@ async def search_places_google(
     params = {
         "query": f"{query} in {city}",
         "language": "zh-CN",
-        "key": GOOGLE_MAPS_API_KEY,
+        "key": api_key,
     }
     try:
         resp = requests.get(GOOGLE_PLACE_TEXTSEARCH_URL, params=params, timeout=12)
-        data = resp.json() if resp.status_code == 200 else {}
+        data = resp.json()
     except Exception as exc:
         return f"Google Places 查询失败：{exc}"
 
+    if resp.status_code != 200:
+        return _google_error_message("Google Places 查询", "HTTP_ERROR", data, resp.status_code)
+
     status = data.get("status", "UNKNOWN_ERROR")
     if status not in {"OK", "ZERO_RESULTS"}:
-        return f"Google Places 查询失败，状态：{status}"
+        return _google_error_message("Google Places 查询", status, data)
     if status == "ZERO_RESULTS":
         return f"{city} 没有找到与“{query}”相关地点。"
 
@@ -73,7 +91,7 @@ async def get_route_google(
     mode: Annotated[str, Field(description="出行方式：walking/driving/transit/bicycling")] = "transit",
 ) -> str:
     """使用 Google Directions 估算两地通勤时间与距离。"""
-    missing = _require_api_key()
+    missing, api_key = _require_api_key()
     if missing:
         return missing
 
@@ -83,17 +101,20 @@ async def get_route_google(
         "destination": destination,
         "mode": transport_mode,
         "language": "zh-CN",
-        "key": GOOGLE_MAPS_API_KEY,
+        "key": api_key,
     }
     try:
         resp = requests.get(GOOGLE_DIRECTIONS_URL, params=params, timeout=12)
-        data = resp.json() if resp.status_code == 200 else {}
+        data = resp.json()
     except Exception as exc:
         return f"Google 路线查询失败：{exc}"
 
+    if resp.status_code != 200:
+        return _google_error_message("Google 路线查询", "HTTP_ERROR", data, resp.status_code)
+
     status = data.get("status", "UNKNOWN_ERROR")
     if status != "OK":
-        return f"Google 路线查询失败，状态：{status}"
+        return _google_error_message("Google 路线查询", status, data)
 
     routes = data.get("routes", [])
     if not routes:

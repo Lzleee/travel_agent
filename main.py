@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 from typing import AsyncGenerator
 from uuid import uuid4
@@ -14,13 +13,15 @@ from openai.types.responses import ResponseTextDeltaEvent
 from pydantic import BaseModel
 
 from agent.sdk_agent import travel_agent
+from utils.logging import dump_item, extract_tool_arguments, extract_tool_output, setup_app_logger, truncate_for_log
 from memory.llm_summarizer import LLMSummarizer
 from memory.store import ConversationMemoryStore
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_FILE_PATH = os.getenv("AGENT_LOG_FILE", "agent.log")
+TOOL_LOG_MAX_CHARS = int(os.getenv("AGENT_TOOL_LOG_MAX_CHARS", "4000"))
+logger = setup_app_logger(LOG_FILE_PATH)
 
 MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "8"))
 MEMORY_DB_PATH = os.getenv("AGENT_MEMORY_DB", "storage/memory.sqlite")
@@ -93,12 +94,14 @@ def extract_tool_name(item) -> str | None:
 async def stream_agent(message: str, session_id: str | None) -> AsyncGenerator[str, None]:
     sid = session_id or uuid4().hex
     logger.info("[Session] id=%s", sid)
+    logger.info("[Request] sid=%s message=%s", sid, message)
     yield sse({"type": "session_id", "session_id": sid})
 
     assistant_reply = ""
     try:
         memory_store.compact_session_history(sid)
         model_input = memory_store.build_input_messages(sid, message)
+        logger.info("[ModelInput] sid=%s payload=%s", sid, json.dumps(model_input, ensure_ascii=False))
         result = Runner.run_streamed(
             travel_agent,
             input=model_input,
@@ -116,20 +119,48 @@ async def stream_agent(message: str, session_id: str | None) -> AsyncGenerator[s
                 if item.type == "tool_call_item":
                     tool_name = extract_tool_name(item) or "tool_call"
                     label = TOOL_LABELS.get(tool_name, tool_name)
-                    logger.info("[Tool] %s", tool_name)
+                    args = extract_tool_arguments(item) or ""
+                    logger.info(
+                        "[Tool] sid=%s name=%s args=%s",
+                        sid,
+                        tool_name,
+                        truncate_for_log(args, TOOL_LOG_MAX_CHARS),
+                    )
+                    if not args:
+                        logger.info(
+                            "[ToolRaw] sid=%s name=%s raw=%s",
+                            sid,
+                            tool_name,
+                            truncate_for_log(dump_item(item), TOOL_LOG_MAX_CHARS),
+                        )
                     yield sse({"type": "tool_start", "name": tool_name, "label": label})
-        memory_store.append_turn(sid, message, assistant_reply.strip())
+                elif item.type in {"tool_call_output_item", "tool_result_item"}:
+                    output = extract_tool_output(item) or ""
+                    logger.info(
+                        "[ToolOutput] sid=%s item_type=%s payload=%s",
+                        sid,
+                        item.type,
+                        truncate_for_log(output, TOOL_LOG_MAX_CHARS),
+                    )
+                else:
+                    logger.info("[RunItem] sid=%s item_type=%s", sid, item.type)
+        final_reply = assistant_reply.strip()
+        memory_store.append_turn(sid, message, final_reply)
+        logger.info("[Response] sid=%s message=%s", sid, final_reply)
     except Exception as exc:  # pragma: no cover - defensive guard for streaming errors
-        logger.exception("Agent run failed: %s", exc)
+        logger.exception("[Error] sid=%s Agent run failed: %s", sid, exc)
         fallback = "抱歉，行程规划服务暂时不可用，请稍后再试。"
         memory_store.append_turn(sid, message, fallback)
+        logger.info("[Response] sid=%s message=%s", sid, fallback)
         yield sse({"type": "content", "text": fallback})
     finally:
+        logger.info("[Done] sid=%s", sid)
         yield sse({"type": "done"})
 
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    logger.info("[HTTP] POST /chat session_id=%s", request.session_id)
     return StreamingResponse(
         stream_agent(request.message, request.session_id),
         media_type="text/event-stream",
